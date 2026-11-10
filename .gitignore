@@ -1,0 +1,4 @@
+# 快捷方式内含绝对路径，换机器即失效，不入库
+*.lnk
+desktop.ini
+Thumbs.db
