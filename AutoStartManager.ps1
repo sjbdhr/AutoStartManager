@@ -117,6 +117,60 @@ function Test-Admin {
 }
 $script:IsAdmin = Test-Admin
 
+function Get-OpErrorText {
+    param($Entry, [string]$Raw)
+    $raw = [string]$Raw
+    $isPriv = Test-PrivilegeError $raw
+    if (-not $isPriv) { return $raw }
+    if (-not $script:IsAdmin) { return '权限不足，请点击左下角「以管理员身份重启」（原始错误：' + $raw + '）' }
+    if ($Entry.Kind -eq 'Service') { return '已是管理员权限仍被拒绝，该服务通常受系统或厂商（安全软件）保护，无法修改启动类型：' + $raw }
+    if ($Entry.Kind -eq 'Task')    { return '已是管理员权限仍被拒绝，该计划任务受系统保护，无法修改：' + $raw }
+    return '已是管理员权限仍被拒绝：' + $raw
+}
+
+function Test-PrivilegeError {
+    param([string]$Raw)
+    return ([string]$Raw -match '拒绝访问|Access is denied|Requested registry access|0x80070005|Unauthorized|权限')
+}
+
+# 以管理员身份重启自身：先隐藏本窗口，等新窗口出现再退出，避免 UAC 取消后窗口凭空消失
+function Start-ElevatedSelf {
+    if ($script:IsAdmin) { Show-Toast '当前已是管理员权限'; return }
+    $myHwnd = [IntPtr]::Zero
+    try {
+        $helper = New-Object System.Windows.Interop.WindowInteropHelper($script:Window)
+        $myHwnd = $helper.Handle
+    } catch { }
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $script:AppPath + '" -AllowSecondInstance'
+    $psi.WorkingDirectory = $script:AppDir
+    $psi.UseShellExecute = $true
+    $psi.Verb = 'runas'
+    if ($myHwnd -ne [IntPtr]::Zero) { try { [AutoStartNative.Win]::ShowWindow($myHwnd, 0) | Out-Null } catch { } }
+    try {
+        [System.Diagnostics.Process]::Start($psi) | Out-Null
+    } catch {
+        if ($myHwnd -ne [IntPtr]::Zero) { try { [AutoStartNative.Win]::ShowWindow($myHwnd, 5) | Out-Null } catch { } }
+        Write-Log ('提权被取消或失败: ' + $_.Exception.Message)
+        Show-Toast '提权被取消，仍以标准权限运行'
+        return
+    }
+    $appeared = $false
+    for ($i = 0; $i -lt 40; $i++) {
+        Start-Sleep -Milliseconds 150
+        $h = [AutoStartNative.Win]::ByTitle($script:WindowTitle)
+        if ($h -ne [IntPtr]::Zero) { $appeared = $true; break }
+    }
+    if ($appeared) {
+        $script:Window.Close()
+    } else {
+        if ($myHwnd -ne [IntPtr]::Zero) { try { [AutoStartNative.Win]::ShowWindow($myHwnd, 5) | Out-Null } catch { } }
+        Write-Log '提权后新窗口未出现'
+        Show-Toast '提权窗口没有出现，请再试一次'
+    }
+}
+
 function Get-HiveRoot {
     param([string]$Hive)
     if ($Hive -eq 'HKCU') { return [Microsoft.Win32.Registry]::CurrentUser }
@@ -1873,35 +1927,11 @@ $script:UI.BtnAdd.Add_Click({
 })
 
 $script:UI.BtnAdmin.Add_Click({
-    try {
-        if ($script:IsAdmin) { Show-Toast '当前已是管理员权限'; return }
-        $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = 'powershell.exe'
-        $psi.UseShellExecute = $true
-        $psi.Verb = 'runas'
-        $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $script:AppPath + '" -AllowSecondInstance'
-        [System.Diagnostics.Process]::Start($psi) | Out-Null
-        Start-Sleep -Milliseconds 400
-        $script:Window.Close()
-    } catch {
-        Set-Status '提权被取消或失败'
-    }
+    try { Start-ElevatedSelf } catch { Set-Status ('提权失败：' + $_.Exception.Message) }
 })
 
 $script:UI.BtnElevate.Add_Click({
-    try {
-        if ($script:IsAdmin) { Show-Toast '当前已是管理员权限'; return }
-        $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = 'powershell.exe'
-        $psi.UseShellExecute = $true
-        $psi.Verb = 'runas'
-        $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $script:AppPath + '" -AllowSecondInstance'
-        [System.Diagnostics.Process]::Start($psi) | Out-Null
-        Start-Sleep -Milliseconds 400
-        $script:Window.Close()
-    } catch {
-        Set-Status '提权被取消或失败'
-    }
+    try { Start-ElevatedSelf } catch { Set-Status ('提权失败：' + $_.Exception.Message) }
 })
 
 # 列表内按钮（统一在 ListBox 上接住冒泡的 Click）
@@ -1937,20 +1967,26 @@ $script:UI.ItemList.AddHandler(
                 'toggle' {
                     $desired = -not [bool]$entry.Enabled
                     if ($entry.Kind -eq 'RunOnce') { Show-Toast '一次性启动项不支持开关，只能移除'; return }
-                    if ($entry.Kind -eq 'Task' -and -not $script:IsAdmin) {
-                        Show-Toast '修改计划任务需要管理员权限'; return
-                    }
-                    if ($entry.Kind -eq 'Service' -and -not $script:IsAdmin) {
-                        Show-Toast '修改服务启动类型需要管理员权限'; return
+                    if (($entry.Kind -eq 'Task' -or $entry.Kind -eq 'Service') -and -not $script:IsAdmin) {
+                        $what = '该类项目'
+                        if ($entry.Kind -eq 'Task') { $what = '计划任务' }
+                        if ($entry.Kind -eq 'Service') { $what = '服务的启动类型' }
+                        $okElev = Show-Confirm -Title '需要管理员权限' -Message ('修改' + $what + '需要管理员权限。' + "`n`n" + '现在以管理员身份重启？重启后可以继续操作，但拖拽添加会被系统拦截，改用「＋ 添加启动项」即可。') -OkText '以管理员重启'
+                        if ($okElev) { Start-ElevatedSelf }
+                        return
                     }
                     try {
                         Set-EntryEnabled -Entry $entry -Enabled $desired
                         if ($desired) { Show-Toast ('已启用：' + $entry.Name) } else { Show-Toast ('已禁用：' + $entry.Name) }
                         Update-List
                     } catch {
-                        $msg = $_.Exception.Message
-                        if ($msg -match '拒绝访问|Access|权限') { $msg = '权限不足，请点击左下角「以管理员身份重启」' }
-                        Show-Toast ('操作失败：' + $msg)
+                        $raw = $_.Exception.Message
+                        Write-Log ('开关失败 [' + $entry.Kind + '] ' + $entry.Name + ' :: ' + $raw)
+                        if (-not $script:IsAdmin -and (Test-PrivilegeError $raw)) {
+                            $okElev = Show-Confirm -Title '需要管理员权限' -Message ('修改「' + $entry.Name + '」被系统拒绝：' + "`n" + $raw + "`n`n" + '现在以管理员身份重启？重启后可以继续操作（拖拽添加会失效，改用「＋ 添加启动项」）。') -OkText '以管理员重启'
+                            if ($okElev) { Start-ElevatedSelf; return }
+                        }
+                        Show-Toast ('操作失败：' + (Get-OpErrorText -Entry $entry -Raw $raw))
                         $script:UI.ItemList.ItemsSource = $null
                         Update-List
                     }
@@ -1968,9 +2004,13 @@ $script:UI.ItemList.AddHandler(
                         Show-Toast ('已移除：' + $entry.Name)
                         Invoke-Scan
                     } catch {
-                        $msg = $_.Exception.Message
-                        if ($msg -match '拒绝访问|Access|权限') { $msg = '权限不足，请点击左下角「以管理员身份重启」' }
-                        Show-Toast ('移除失败：' + $msg)
+                        $raw = $_.Exception.Message
+                        Write-Log ('移除失败 [' + $entry.Kind + '] ' + $entry.Name + ' :: ' + $raw)
+                        if (-not $script:IsAdmin -and (Test-PrivilegeError $raw)) {
+                            $okElev = Show-Confirm -Title '需要管理员权限' -Message ('移除「' + $entry.Name + '」被系统拒绝：' + "`n" + $raw + "`n`n" + '现在以管理员身份重启？重启后可以继续操作（拖拽添加会失效，改用「＋ 添加启动项」）。') -OkText '以管理员重启'
+                            if ($okElev) { Start-ElevatedSelf; return }
+                        }
+                        Show-Toast ('移除失败：' + (Get-OpErrorText -Entry $entry -Raw $raw))
                     }
                 }
                 'restore' {
@@ -1979,9 +2019,9 @@ $script:UI.ItemList.AddHandler(
                         Show-Toast ('已恢复：' + $entry.Name)
                         Invoke-Scan
                     } catch {
-                        $msg = $_.Exception.Message
-                        if ($msg -match '拒绝访问|Access|权限') { $msg = '权限不足，请点击左下角「以管理员身份重启」' }
-                        Show-Toast ('恢复失败：' + $msg)
+                        $raw = $_.Exception.Message
+                        Write-Log ('恢复失败 [trash] ' + $entry.Name + ' :: ' + $raw)
+                        Show-Toast ('恢复失败：' + $raw)
                     }
                 }
                 'purge' {
@@ -1991,7 +2031,11 @@ $script:UI.ItemList.AddHandler(
                         Remove-QuarantineEntry -TrashEntry $entry
                         Show-Toast '已彻底删除'
                         Invoke-Scan
-                    } catch { Show-Toast ('删除失败：' + $_.Exception.Message) }
+                    } catch {
+                        $raw = $_.Exception.Message
+                        Write-Log ('彻底删除失败 [trash] ' + $entry.Name + ' :: ' + $raw)
+                        Show-Toast ('删除失败：' + $raw)
+                    }
                 }
             }
         } catch {
